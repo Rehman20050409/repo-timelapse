@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Repo Time-lapse — watch a GitHub project grow</title>
+<meta name="description" content="Type any public GitHub repository and watch its files grow from the first commit to today.">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<style>
+  :root { --bg: #1b1b1d; --panel: #232326; --text: #efeff1; --muted: #a9a9b0; --line: #36363b; --accent: #a3a8ff; --error: #ff9a9a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--muted); font: 15px/1.6 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { color: var(--text); font-size: 28px; margin: 0; display: flex; align-items: center; gap: 10px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  form { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; margin-top: 20px; }
+  label { display: grid; gap: 4px; color: var(--text); font-size: 14px; }
+  input[type=text] { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; width: 100%; }
+  button { font: inherit; color: #16162a; background: var(--accent); border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 500; cursor: pointer; }
+  button.quiet { background: none; color: var(--accent); padding: 0; font-weight: 400; text-decoration: underline; }
+  button:disabled { opacity: .5; cursor: default; }
+  #error { color: var(--error); margin: 8px 0 0; }
+  #progress { margin: 8px 0 0; min-height: 1.6em; }
+  canvas { width: 100%; aspect-ratio: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: block; margin: 12px 0; }
+  .player { display: grid; grid-template-columns: auto 1fr; gap: 14px; align-items: center; }
+  .player button { min-width: 84px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  #moment { color: var(--text); margin: 12px 0 0; min-height: 3.2em; }
+  #moment small { display: block; color: var(--muted); font-size: 14px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; list-style: none; padding: 0; margin: 12px 0 0; font-size: 14px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1><img src="logo.svg" alt="" width="40" height="40">Repo Time-lapse</h1>
+  <p>Type any public GitHub repository and watch it grow from its first commit to today. Each dot is a file; each branch is a folder.</p>
+
+  <form id="form">
+    <label>Repository <input type="text" id="repo" placeholder="owner/name or a GitHub link" autocapitalize="off" autocomplete="off" spellcheck="false" required></label>
+    <button id="watch">Watch</button>
+  </form>
+  <button type="button" class="quiet" id="example">Or try an example</button>
+  <p id="progress" role="status"></p>
+  <p id="error" role="alert"></p>
+
+  <div id="viewer" hidden>
+    <canvas id="canvas" width="900" height="900" role="img" aria-label="The repository's files drawn as a tree that grows over time"></canvas>
+    <div class="player">
+      <button type="button" id="play">Pause</button>
+      <label>Moment in history <input type="range" id="slider" min="0" value="0"></label>
+    </div>
+    <p id="moment" aria-live="polite"></p>
+    <ul class="legend" id="legend" aria-label="File types"></ul>
+  </div>
+</main>
+
+<script src="timelapse.js"></script>
+<script src="sample.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const canvas = $('canvas'), ctx = canvas.getContext('2d');
+const PALETTE = ['#a3a8ff', '#7fd6a0', '#ff9ecb', '#ffd166', '#7cc7f2', '#d59cff', '#ffa77a'];
+const OTHER = '#8a8a94';
+
+let snapshots, dots, colorOf, current = 0, timer = null, drawing = false;
+
+const extension = (name) => (name.includes('.') && !name.startsWith('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : 'other');
+
+function show(name, loaded) {
+  snapshots = loaded;
+  const { root, capped } = buildTree(snapshots);
+  dots = layout(root, 410);
+  for (const dot of dots) dot.alpha = 0;
+
+  // the most common file types get their own colour, the rest share grey
+  const counts = new Map();
+  for (const dot of dots) if (dot.isFile) counts.set(extension(dot.name), (counts.get(extension(dot.name)) ?? 0) + 1);
+  const common = [...counts].filter(([ext]) => ext !== 'other').sort((a, b) => b[1] - a[1]).slice(0, PALETTE.length);
+  colorOf = new Map(common.map(([ext], i) => [ext, PALETTE[i]]));
+  $('legend').replaceChildren(...[...common.map(([ext], i) => [`.${ext}`, PALETTE[i]]), ['other', OTHER]].map(([label, color]) => {
+    const item = document.createElement('li'), swatch = document.createElement('i');
+    swatch.style.background = color;
+    item.append(swatch, label);
+    return item;
+  }));
+
+  $('viewer').hidden = false;
+  $('slider').max = snapshots.length - 1;
+  $('progress').textContent = capped ? `${name} is big, so only its first ${MAX_FILES.toLocaleString()} files are drawn.` : '';
+  goTo(0);
+  setPlaying(snapshots.length > 1);
+  if (!drawing) { // one drawing loop, however many repositories are loaded
+    drawing = true;
+    requestAnimationFrame(frame);
+  }
+}
+
+function goTo(index) {
+  current = index;
+  $('slider').value = index;
+  const s = snapshots[index];
+  const date = new Date(s.date).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const small = document.createElement('small');
+  small.textContent = `${s.sha} · ${s.message}`;
+  $('moment').replaceChildren(`${date} · ${s.paths.length.toLocaleString()} files`, small);
+}
+
+function setPlaying(on) {
+  clearInterval(timer);
+  timer = on ? setInterval(() => {
+    if (current >= snapshots.length - 1) return setPlaying(false);
+    goTo(current + 1);
+  }, 1400) : null;
+  $('play').textContent = on ? 'Pause' : current >= snapshots.length - 1 ? 'Replay' : 'Play';
+}
+
+// Every frame each dot eases towards being shown or hidden, sliding out from its folder as it appears.
+function frame() {
+  const mid = canvas.width / 2;
+  const small = dots.length > 1500;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const dot of dots) {
+    dot.alpha += ((dot.present[current] ? 1 : 0) - dot.alpha) * 0.1;
+    const from = dot.parent ?? { sx: mid, sy: mid, x: 0, y: 0 };
+    dot.sx = from.sx + (dot.x - from.x) * dot.alpha;
+    dot.sy = from.sy + (dot.y - from.y) * dot.alpha;
+    if (dot.alpha < 0.01) continue;
+    ctx.globalAlpha = dot.alpha;
+    if (dot.parent) {
+      ctx.strokeStyle = 'rgba(169, 169, 176, 0.22)';
+      ctx.beginPath();
+      ctx.moveTo(from.sx, from.sy);
+      ctx.lineTo(dot.sx, dot.sy);
+      ctx.stroke();
+    }
+    ctx.fillStyle = !dot.parent ? '#efeff1' : dot.isFile ? colorOf.get(extension(dot.name)) ?? OTHER : '#6d6d78';
+    ctx.beginPath();
+    ctx.arc(dot.sx, dot.sy, !dot.parent ? 6 : dot.isFile ? (small ? 2.5 : 4) : 2, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  requestAnimationFrame(frame);
+}
+
+$('form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('error').textContent = '';
+  $('watch').disabled = true;
+  try {
+    const { owner, repo } = parseRepo($('repo').value);
+    $('progress').textContent = 'Looking up the history…';
+    const loaded = await loadRepo(owner, repo, {
+      onProgress: (done, of) => { $('progress').textContent = `Loading moment ${done} of ${of}…`; },
+    });
+    show(`${owner}/${repo}`, loaded);
+  } catch (e) {
+    $('progress').textContent = '';
+    $('error').textContent = e instanceof TypeError ? "Couldn't reach GitHub. Check your connection and try again." : e.message;
+  } finally {
+    $('watch').disabled = false;
+  }
+});
+$('example').addEventListener('click', () => { $('error').textContent = ''; $('repo').value = SAMPLE.name; show(SAMPLE.name, SAMPLE.snapshots); });
+$('play').addEventListener('click', () => {
+  if (!timer && current >= snapshots.length - 1) goTo(0);
+  setPlaying(!timer);
+});
+$('slider').addEventListener('input', () => { setPlaying(false); goTo(Number($('slider').value)); setPlaying(false); });
+</script>
+</body>
+</html>
